@@ -11,14 +11,15 @@ from torch import optim
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
-from utils.data_loading import BasicDataset, CarvanaDataset
+from utils.data_loading import BasicDataset, FishDataset
 from utils.dice_score import dice_loss
 from evaluate import evaluate
-from unet import UNet
+# from unet import UNet_3Plus as UNet
+from unet import UNet as UNet
 
-dir_img = Path('./data/imgs/')
-dir_mask = Path('./data/masks/')
-dir_checkpoint = Path('./checkpoints/')
+dir_img = Path('')
+dir_mask = Path('')
+dir_checkpoint = Path('./saved_models/')
 
 
 def train_net(net,
@@ -32,9 +33,9 @@ def train_net(net,
               amp: bool = False):
     # 1. Create dataset
     try:
-        dataset = CarvanaDataset(dir_img, dir_mask, img_scale)
+        dataset = FishDataset(dir_img, dir_mask, img_scale, low_aug=args.low_augment)
     except (AssertionError, RuntimeError):
-        dataset = BasicDataset(dir_img, dir_mask, img_scale)
+        dataset = BasicDataset(dir_img, dir_mask, img_scale, low_aug=args.low_augment)
 
     # 2. Split into train / validation partitions
     n_val = int(len(dataset) * val_percent)
@@ -42,7 +43,7 @@ def train_net(net,
     train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
 
     # 3. Create data loaders
-    loader_args = dict(batch_size=batch_size, num_workers=4, pin_memory=True)
+    loader_args = dict(batch_size=batch_size, num_workers=8, pin_memory=True, prefetch_factor=160)
     train_loader = DataLoader(train_set, shuffle=True, **loader_args)
     val_loader = DataLoader(val_set, shuffle=False, drop_last=True, **loader_args)
 
@@ -65,11 +66,12 @@ def train_net(net,
     ''')
 
     # 4. Set up the optimizer, the loss, the learning rate scheduler and the loss scaling for AMP
-    optimizer = optim.RMSprop(net.parameters(), lr=learning_rate, weight_decay=1e-8, momentum=0.9)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=2)  # goal: maximize Dice score
+    optimizer = optim.Adam(net.parameters(), lr=learning_rate)  # optim.RMSprop(net.parameters(), lr=learning_rate, weight_decay=1e-8, momentum=0.9)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', factor=0.4, patience=3, min_lr=1e-8, verbose=False)  # goal: maximize Dice score
     grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
     criterion = nn.CrossEntropyLoss()
     global_step = 0
+    best_val_score = 0
 
     # 5. Begin training
     for epoch in range(epochs):
@@ -79,7 +81,7 @@ def train_net(net,
             for batch in train_loader:
                 images = batch['image']
                 true_masks = batch['mask']
-
+                
                 assert images.shape[1] == net.n_channels, \
                     f'Network has been defined with {net.n_channels} input channels, ' \
                     f'but loaded images have {images.shape[1]} channels. Please check that ' \
@@ -90,6 +92,7 @@ def train_net(net,
 
                 with torch.cuda.amp.autocast(enabled=amp):
                     masks_pred = net(images)
+                    
                     loss = criterion(masks_pred, true_masks) \
                            + dice_loss(F.softmax(masks_pred, dim=1).float(),
                                        F.one_hot(true_masks, net.n_classes).permute(0, 3, 1, 2).float(),
@@ -111,7 +114,7 @@ def train_net(net,
                 pbar.set_postfix(**{'loss (batch)': loss.item()})
 
                 # Evaluation round
-                division_step = (n_train // (10 * batch_size))
+                division_step = (n_train // (2 * batch_size))
                 if division_step > 0:
                     if global_step % division_step == 0:
                         histograms = {}
@@ -120,24 +123,30 @@ def train_net(net,
                             histograms['Weights/' + tag] = wandb.Histogram(value.data.cpu())
                             histograms['Gradients/' + tag] = wandb.Histogram(value.grad.data.cpu())
 
-                        val_score = evaluate(net, val_loader, device)
-                        scheduler.step(val_score)
+            val_score = evaluate(net, val_loader, device)
+            scheduler.step(val_score)
 
-                        logging.info('Validation Dice score: {}'.format(val_score))
-                        experiment.log({
-                            'learning rate': optimizer.param_groups[0]['lr'],
-                            'validation Dice': val_score,
-                            'images': wandb.Image(images[0].cpu()),
-                            'masks': {
-                                'true': wandb.Image(true_masks[0].float().cpu()),
-                                'pred': wandb.Image(torch.softmax(masks_pred, dim=1).argmax(dim=1)[0].float().cpu()),
-                            },
-                            'step': global_step,
-                            'epoch': epoch,
-                            **histograms
-                        })
+            logging.info('Validation Dice score: {}'.format(val_score))
+            experiment.log({
+                'learning rate': optimizer.param_groups[0]['lr'],
+                'validation Dice': val_score,
+                'images': wandb.Image(images[0].cpu()),
+                'masks': {
+                    'true': wandb.Image(true_masks[0].float().cpu()),
+                    'pred': wandb.Image(torch.softmax(masks_pred, dim=1).argmax(dim=1)[0].float().cpu()),
+                },
+                'step': global_step,
+                'epoch': epoch,
+                **histograms
+            })
+            
+            if val_score > best_val_score:
+                best_val_score = val_score
+                Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
+                torch.save(net.state_dict(), str(dir_checkpoint / 'best.pth'))
+                logging.info(f'Best checkpoint {epoch + 1} saved! val_score: {best_val_score}')
 
-        if save_checkpoint:
+        if epoch == epochs - 1 or save_checkpoint and epoch % args.save_epochs == 0:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
             torch.save(net.state_dict(), str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch + 1)))
             logging.info(f'Checkpoint {epoch + 1} saved!')
@@ -145,15 +154,21 @@ def train_net(net,
 
 def get_args():
     parser = argparse.ArgumentParser(description='Train the UNet on images and target masks')
+    parser.add_argument('--data', '-d', type=str, default='data', help='Datasets path.')
     parser.add_argument('--epochs', '-e', metavar='E', type=int, default=5, help='Number of epochs')
-    parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=1, help='Batch size')
-    parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=0.00001,
+    parser.add_argument('--save-epochs', '-a', metavar='A', type=int, default=5, help='Number of epochs to save models.')
+    parser.add_argument('--n_channels', type=int, default=3, help='Number of input channals')
+    parser.add_argument('--n_classes', type=int, default=2, help='Number of output channals')
+    parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=8, help='Batch size')
+    parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=0.0005,
                         help='Learning rate', dest='lr')
     parser.add_argument('--load', '-f', type=str, default=False, help='Load model from a .pth file')
     parser.add_argument('--scale', '-s', type=float, default=0.5, help='Downscaling factor of the images')
     parser.add_argument('--validation', '-v', dest='val', type=float, default=10.0,
                         help='Percent of the data that is used as validation (0-100)')
     parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
+    parser.add_argument('--low_augment', action='store_true', default=False, help='Reduce augments.')
+    parser.add_argument('--name', '-n', type=str, default='', help='Save model to.')
 
     return parser.parse_args()
 
@@ -168,7 +183,8 @@ if __name__ == '__main__':
     # Change here to adapt to your data
     # n_channels=3 for RGB images
     # n_classes is the number of probabilities you want to get per pixel
-    net = UNet(n_channels=3, n_classes=2, bilinear=True)
+    net = UNet(n_channels=args.n_channels, n_classes=args.n_classes, bilinear=True)
+    net.to(device=device)
 
     logging.info(f'Network:\n'
                  f'\t{net.n_channels} input channels\n'
@@ -178,9 +194,13 @@ if __name__ == '__main__':
     if args.load:
         net.load_state_dict(torch.load(args.load, map_location=device))
         logging.info(f'Model loaded from {args.load}')
-
-    net.to(device=device)
+    
     try:
+        dir_img = dir_img.joinpath(args.data).joinpath('imgs')
+        dir_mask = dir_mask.joinpath(args.data).joinpath('masks_npy')
+        assert Path(dir_img).exists(), f'Datasets path not exists: {dir_img}. '
+        assert Path(dir_mask).exists(), f'Datasets path not exists: {dir_mask}. '
+        dir_checkpoint = dir_checkpoint.joinpath(args.name)
         train_net(net=net,
                   epochs=args.epochs,
                   batch_size=args.batch_size,
